@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  # 実行間隔
+  ExecutionSchedule:
+    Description: "see https://docs.aws.amazon.com/ja_jp/AmazonCloudWatch/latest/events/ScheduledEvents.html#RateExpressions"
+    Type: String
+    MinLength: 1
+    Default: "rate(5 minutes)"
+  # この名前のTagがtrueであるFunctionを起動します
+  TargetLambdaTagName:
+    Type: String
+    Description: "Invoke Lambda that has Tag with this name. and Tag value is 'true'"
+    Default: "prewarm"
+    MinLength: 1
+
+Resources:
+  # 実行するFunction
+  PrewarmExecutor:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+
+          const listFunctions = () => new Promise((resolve, reject) => {
+            const lambda = new AWS.Lambda();
+            const functions = [];
+            const loop = (marker) => {
+              lambda.listFunctions({
+                  Marker: marker,
+                  MaxItems: 3
+                }).promise()
+                .then((result) => {
+                  result.Functions.forEach(func => functions.push({ arn: func.FunctionArn, name: func.FunctionName }));
+                  const nextMarker = result.NextMarker;
+                  if (nextMarker) {
+                    loop(nextMarker);
+                  } else {
+                    console.log('All Functions', functions.map(fun => fun.arn));
+                    resolve(functions);
+                  }
+                })
+                .catch(reject);
+            };
+
+            loop();
+          });
+
+          const filterFunctionsByTag = (functions = [], { tagName, tagValue }) => new Promise((resolve, reject) => {
+            const lambda = new AWS.Lambda();
+            const filtered = [];
+            const loop = (index = 0) => {
+              if (!functions[index]) {
+                console.log('Filtered Functions', filtered.map(fun => fun.arn));
+                resolve(filtered);
+                return;
+              }
+              lambda.listTags({ Resource: functions[index].arn }).promise()
+                .then((result) => {
+                  if (result.Tags[tagName] === tagValue) {
+                    filtered.push(functions[index]);
+                  }
+                  loop(index + 1);
+                })
+                .catch(reject);
+            };
+            loop();
+          });
+
+          const invokeFuncionsAsync = (functions = [], param) => new Promise((resolve, reject) => {
+            const lambda = new AWS.Lambda();
+            const loop = (index = 0) => {
+              if (!functions[index]) {
+                resolve();
+                return;
+              }
+              lambda.invokeAsync({
+                  FunctionName: functions[index].name,
+                  InvokeArgs: JSON.stringify(param)
+                }).promise()
+                .then((result) => {
+                  console.log(`function ${functions[index].name} invoked.`);
+                  loop(index + 1);
+                })
+                .catch((e) => {
+                  console.log(`function ${functions[index].name} invocation failed.`, e);
+                  reject(e);
+                });
+            };
+            loop();
+          });
+
+          exports.handler = function(ev, cx, cb) {
+            console.log(ev);
+            console.log(`Filter by tag [${process.env.TargetLambdaTagName}=true]`);
+            listFunctions()
+              .then(functions => filterFunctionsByTag(functions, { tagName: process.env.TargetLambdaTagName, tagValue: 'true' }))
+              .then(filtered => invokeFuncionsAsync(filtered, { isPrewarm: true }))
+              .then(() => cb())
+              .catch(cb);
+          };
+      Handler: index.handler
+      MemorySize: 128
+      Runtime: nodejs6.10
+      Timeout: 300
+      Role: !GetAtt FunctionRole.Arn
+      Environment:
+        Variables:
+          TargetLambdaTagName: !Ref TargetLambdaTagName
+  # FunctionのRole
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Principal:
+              Service: lambda.amazonaws.com
+            Effect: Allow
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: default
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - lambda:Invoke*
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                Effect: Allow
+                Resource: "*"
+
+  # Eventsから呼び出すためのPermission
+  PermissionToPrewarmExecutor:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: PrewarmExecutor
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${PrewarmEventRule}"
+
+  # Event
+  PrewarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "Prewarm Event (created by CloudFormation Stack '${AWS::StackName}')"
+      Name: !Sub "PrewarmExecutor-${AWS::StackName}"
+      ScheduleExpression: !Ref ExecutionSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PrewarmExecutor.Arn
+          Id: LambdaFunction
